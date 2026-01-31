@@ -1,10 +1,10 @@
 schema_version = "1.0.0"
 
 # Blender extension manifest
-id = "geiger_counter_vse"
+id = "event_sounds_vse"
 version = "1.0.0"
-name = "Geiger Counter VSE"
-tagline = "Insert Geiger counter sounds into the Video Sequence Editor"
+name = "Event Sounds VSE"
+tagline = "Insert event sounds into the Video Sequence Editor"
 maintainer = "Jan-hendrik Müller"
 # Supported types: "add-on", "theme"
 type = "add-on"
