@@ -2,7 +2,7 @@ schema_version = "1.0.0"
 
 # Blender extension manifest
 id = "event_sounds_vse"
-version = "1.0.0"
+version = "0.2.0"
 name = "Event Sounds VSE"
 tagline = "Insert event sounds into the Video Sequence Editor"
 maintainer = "Jan-hendrik Müller"
