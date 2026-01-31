@@ -13,7 +13,7 @@
 
 import bpy
 from bpy.types import Panel, PropertyGroup, Operator
-from bpy.props import PointerProperty, StringProperty
+from bpy.props import PointerProperty, StringProperty, IntProperty
 
 
 def get_speakers(self, context):
@@ -37,6 +37,21 @@ class ENHANCED_SPEAKER_PG_settings(PropertyGroup):
         name="Selected Speaker",
         description="The currently selected speaker object",
         default="",
+    )
+    
+    nla_duplicate_count: IntProperty(
+        name="Duplicate Count",
+        description="Number of times to duplicate the NLA strip",
+        default=50,
+        min=1,
+        max=1000,
+    )
+    
+    nla_frame_offset: IntProperty(
+        name="Frame Offset",
+        description="Number of frames between each duplicated strip",
+        default=24,
+        min=1,
     )
 
 
@@ -179,11 +194,11 @@ class ENHANCED_SPEAKER_PT_main_panel(Panel):
                         break
             
             if speaker_obj:
-                self.draw_speaker_info(layout, speaker_obj)
+                self.draw_speaker_info(layout, context, speaker_obj)
             else:
                 layout.label(text="Speaker not found", icon='ERROR')
     
-    def draw_speaker_info(self, layout, speaker_obj):
+    def draw_speaker_info(self, layout, context, speaker_obj):
         """Draw information about the selected speaker."""
         box = layout.box()
         box.label(text=f"Speaker: {speaker_obj.name}", icon='SPEAKER')
@@ -224,6 +239,44 @@ class ENHANCED_SPEAKER_PT_main_panel(Panel):
         else:
             box.label(text="No sound loaded", icon='INFO')
             box.operator("enhanced_speaker.select_sound", text="Load Sound", icon='FILEBROWSER')
+        
+        # NLA Strip Duplication section
+        self.draw_nla_section(layout, context, speaker_obj)
+    
+    def draw_nla_section(self, layout, context, speaker_obj):
+        """Draw NLA strip duplication controls."""
+        settings = context.scene.enhanced_speaker
+        
+        box = layout.box()
+        box.label(text="NLA Strip Duplication", icon='NLA')
+        
+        adt = speaker_obj.animation_data
+        has_nla = adt and adt.nla_tracks and len(adt.nla_tracks) > 0
+        
+        if has_nla:
+            # Show NLA track info
+            track_count = len(adt.nla_tracks)
+            strip_count = sum(len(track.strips) for track in adt.nla_tracks)
+            box.label(text=f"Tracks: {track_count}, Strips: {strip_count}")
+            
+            box.separator()
+            
+            # Duplication settings
+            col = box.column(align=True)
+            col.prop(settings, "nla_duplicate_count", text="Count")
+            col.prop(settings, "nla_frame_offset", text="Frame Offset")
+            
+            box.separator()
+            
+            # Duplicate button
+            box.operator(
+                "enhanced_speaker.duplicate_nla_strips",
+                text="Duplicate NLA Strips",
+                icon='DUPLICATE'
+            )
+        else:
+            box.label(text="No NLA data", icon='INFO')
+            box.label(text="Add animation data first")
 
 
 class ENHANCED_SPEAKER_OT_set_speaker(Operator):
@@ -236,6 +289,78 @@ class ENHANCED_SPEAKER_OT_set_speaker(Operator):
     
     def execute(self, context):
         context.scene.enhanced_speaker.selected_speaker = self.speaker_name
+        return {'FINISHED'}
+
+
+class ENHANCED_SPEAKER_OT_duplicate_nla_strips(Operator):
+    """Duplicate NLA strips for the selected speaker at regular frame intervals"""
+    bl_idname = "enhanced_speaker.duplicate_nla_strips"
+    bl_label = "Duplicate NLA Strips"
+    bl_options = {'REGISTER', 'UNDO'}
+    
+    @classmethod
+    def poll(cls, context):
+        settings = context.scene.enhanced_speaker
+        speaker_name = settings.selected_speaker
+        if speaker_name and speaker_name in bpy.data.objects:
+            speaker_obj = bpy.data.objects[speaker_name]
+            if speaker_obj.type == 'SPEAKER' and speaker_obj.animation_data:
+                return speaker_obj.animation_data.nla_tracks
+        return False
+    
+    def execute(self, context):
+        settings = context.scene.enhanced_speaker
+        speaker_obj = bpy.data.objects.get(settings.selected_speaker)
+        
+        if not speaker_obj or speaker_obj.type != 'SPEAKER':
+            self.report({'ERROR'}, "No valid speaker selected")
+            return {'CANCELLED'}
+        
+        adt = speaker_obj.animation_data
+        if not adt or not adt.nla_tracks:
+            self.report({'ERROR'}, "Speaker has no NLA tracks")
+            return {'CANCELLED'}
+        
+        # Find NLA Editor area and region
+        nla_area = None
+        nla_region = None
+        
+        for area in context.window.screen.areas:
+            if area.type == 'NLA_EDITOR':
+                nla_area = area
+                for region in area.regions:
+                    if region.type == 'WINDOW':
+                        nla_region = region
+                        break
+                break
+        
+        if not nla_area or not nla_region:
+            self.report({'ERROR'}, "Please open an NLA Editor window first")
+            return {'CANCELLED'}
+        
+        duplicate_count = settings.nla_duplicate_count
+        offset = settings.nla_frame_offset
+        
+        # Use context override to run NLA operations
+        with context.temp_override(
+            window=context.window,
+            screen=context.screen,
+            area=nla_area,
+            region=nla_region,
+            active_object=speaker_obj,
+            object=speaker_obj,
+        ):
+            for _ in range(duplicate_count):
+                bpy.ops.nla.duplicate_linked_move()
+                
+                # Move the newly duplicated strip
+                for track in adt.nla_tracks:
+                    for strip in track.strips:
+                        if strip.select:
+                            strip.frame_start += offset
+                            strip.frame_end += offset
+        
+        self.report({'INFO'}, f"Duplicated NLA strips {duplicate_count} times with {offset} frame offset")
         return {'FINISHED'}
 
 
