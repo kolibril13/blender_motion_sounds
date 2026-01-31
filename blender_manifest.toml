@@ -1,12 +1,11 @@
 schema_version = "1.0.0"
 
-# Example of manifest file for a Blender extension
-# Change the values according to your extension
-id = "jan-hendrik_müller"
+# Blender extension manifest
+id = "geiger_counter_vse"
 version = "1.0.0"
-name = "Jan-hendrik Müller"
-tagline = "This is another extension"
-maintainer = "Enhanced Speaker"
+name = "Geiger Counter VSE"
+tagline = "Insert Geiger counter sounds into the Video Sequence Editor"
+maintainer = "Jan-hendrik Müller"
 # Supported types: "add-on", "theme"
 type = "add-on"
 
