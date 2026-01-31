@@ -13,6 +13,34 @@
 
 import bpy
 import os
+from bpy.types import Panel, PropertyGroup, Operator
+from bpy.props import PointerProperty, StringProperty, IntProperty
+
+
+class VSE_PG_EventSoundSettings(PropertyGroup):
+    """Property group for event sound settings."""
+    
+    sound_file: StringProperty(
+        name="Sound File",
+        description="Path to the sound file to insert",
+        subtype='FILE_PATH',
+        default="",
+    )
+    
+    repeat_count: IntProperty(
+        name="Repeat Count",
+        description="Number of times to insert the sound",
+        default=5,
+        min=1,
+        max=1000,
+    )
+    
+    frame_offset: IntProperty(
+        name="Frame Offset",
+        description="Number of frames between each sound (0 = back to back)",
+        default=24,
+        min=0,
+    )
 
 
 def get_sequencer_scene(context):
@@ -60,16 +88,47 @@ def get_all_strips(sed):
     return []
 
 
-class VSE_OT_InsertEventSound(bpy.types.Operator):
-    """Insert the event sound 5 times into the VSE"""
+class VSE_OT_SelectSoundFile(Operator):
+    """Open file browser to select a sound file"""
+    bl_idname = "vse_event.select_sound_file"
+    bl_label = "Select Sound File"
+    bl_options = {'REGISTER'}
+    
+    filepath: StringProperty(
+        subtype='FILE_PATH',
+        default="",
+    )
+    
+    filter_glob: StringProperty(
+        default="*.wav;*.mp3;*.ogg;*.flac;*.aiff;*.aif",
+        options={'HIDDEN'},
+    )
+    
+    def execute(self, context):
+        context.scene.vse_event_sound_settings.sound_file = self.filepath
+        return {'FINISHED'}
+    
+    def invoke(self, context, event):
+        context.window_manager.fileselect_add(self)
+        return {'RUNNING_MODAL'}
+
+
+class VSE_OT_InsertEventSound(Operator):
+    """Insert the event sound into the VSE"""
     bl_idname = "sequencer.insert_event_sound"
     bl_label = "Insert Event Sound"
     bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, context):
-        # Get the path to the sound file (relative to this addon)
-        addon_dir = os.path.dirname(os.path.realpath(__file__))
-        sound_path = os.path.join(addon_dir, "geiger_counter_sound.wav")
+        settings = context.scene.vse_event_sound_settings
+        
+        # Get the sound file path
+        sound_path = bpy.path.abspath(settings.sound_file)
+        
+        # If no custom sound file, use the default bundled one
+        if not sound_path or not os.path.exists(sound_path):
+            addon_dir = os.path.dirname(os.path.realpath(__file__))
+            sound_path = os.path.join(addon_dir, "geiger_counter_sound.wav")
 
         # Check if the file exists
         if not os.path.exists(sound_path):
@@ -97,12 +156,17 @@ class VSE_OT_InsertEventSound(bpy.types.Operator):
 
         # Get the current frame as starting point
         current_frame = scene.frame_current
+        
+        # Get settings
+        repeat_count = settings.repeat_count
+        custom_offset = settings.frame_offset
 
-        # Insert the sound 5 times sequentially
+        # Insert the sound strips
         inserted_count = 0
-        frame_offset = current_frame
+        frame_position = current_frame
+        sound_length = None
 
-        for i in range(5):
+        for i in range(repeat_count):
             try:
                 # Add the sound strip
                 strip = add_sound_strip(
@@ -110,18 +174,30 @@ class VSE_OT_InsertEventSound(bpy.types.Operator):
                     name=f"EventSound_{i+1}",
                     filepath=sound_path,
                     channel=channel,
-                    frame_start=frame_offset
+                    frame_start=frame_position
                 )
                 
-                # Move the offset for the next strip
-                # Handle both old and new property names
-                if hasattr(strip, 'frame_final_end'):
-                    frame_offset = strip.frame_final_end
-                elif hasattr(strip, 'frame_end'):
-                    frame_offset = strip.frame_end
+                # Calculate sound length from first strip
+                if sound_length is None:
+                    if hasattr(strip, 'frame_final_end'):
+                        sound_length = strip.frame_final_end - strip.frame_final_start
+                    elif hasattr(strip, 'frame_end'):
+                        sound_length = strip.frame_end - strip.frame_start
+                    else:
+                        sound_length = 48  # Fallback
+                
+                # Move to next position based on offset setting
+                if custom_offset > 0:
+                    # Use custom frame offset
+                    frame_position += custom_offset
                 else:
-                    # Estimate based on typical audio length
-                    frame_offset += 48  # Fallback
+                    # Back to back (use sound length)
+                    if hasattr(strip, 'frame_final_end'):
+                        frame_position = strip.frame_final_end
+                    elif hasattr(strip, 'frame_end'):
+                        frame_position = strip.frame_end
+                    else:
+                        frame_position += sound_length
                     
                 inserted_count += 1
             except Exception as e:
@@ -132,26 +208,68 @@ class VSE_OT_InsertEventSound(bpy.types.Operator):
         return {'FINISHED'}
 
 
-class VSE_PT_EventSoundsPanel(bpy.types.Panel):
-    """Panel in the N-panel of the Video Sequence Editor"""
+class VSE_PT_EventSoundsPanel(Panel):
+    """Panel in the N-panel of the 3D Viewport"""
     bl_label = "Event Sounds"
     bl_idname = "VSE_PT_event_sounds_panel"
-    bl_space_type = 'SEQUENCE_EDITOR'
+    bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
     bl_category = "Event Sounds"
 
     def draw(self, context):
         layout = self.layout
+        settings = context.scene.vse_event_sound_settings
+        
+        # Sound file selection
+        box = layout.box()
+        box.label(text="Sound File:", icon='SOUND')
+        
+        if settings.sound_file:
+            # Show current file name
+            filename = os.path.basename(settings.sound_file)
+            box.label(text=filename)
+        else:
+            box.label(text="(Using default sound)")
+        
+        box.operator(
+            "vse_event.select_sound_file",
+            text="Select Sound File",
+            icon='FILEBROWSER'
+        )
+        
+        layout.separator()
+        
+        # Settings
+        box = layout.box()
+        box.label(text="Settings:", icon='SETTINGS')
+        col = box.column(align=True)
+        col.prop(settings, "repeat_count", text="Repeat Count")
+        col.prop(settings, "frame_offset", text="Frame Offset")
+        
+        # Info about frame offset
+        if settings.frame_offset == 0:
+            box.label(text="(Back to back)", icon='INFO')
+        else:
+            box.label(text=f"(Every {settings.frame_offset} frames)", icon='INFO')
+        
+        layout.separator()
         
         # Main button to insert sounds
         layout.operator(
             VSE_OT_InsertEventSound.bl_idname,
-            text="Insert 5x Event Sound",
+            text=f"Insert {settings.repeat_count}x Sound",
             icon='SPEAKER'
         )
         
-        # Info box
+        # Info about where sounds will be inserted
         box = layout.box()
-        box.label(text="Inserts the event sound", icon='INFO')
-        box.label(text="5 times sequentially")
-        box.label(text="starting at the playhead.")
+        box.label(text="Inserts into the VSE", icon='SEQUENCE')
+        box.label(text="starting at playhead")
+
+
+def register():
+    bpy.types.Scene.vse_event_sound_settings = PointerProperty(type=VSE_PG_EventSoundSettings)
+
+
+def unregister():
+    del bpy.types.Scene.vse_event_sound_settings
