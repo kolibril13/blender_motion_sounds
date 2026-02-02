@@ -55,16 +55,34 @@ def get_bone_collections(self, context):
 class VSE_PG_EventSoundSettings(PropertyGroup):
     """Property group for event sound settings."""
     
-    sound_folder: StringProperty(
-        name="Sound Folder",
-        description="Path to folder containing sound files (wav, mp3, ogg, flac, aiff)",
-        subtype='DIR_PATH',
+    sound_file: StringProperty(
+        name="Sound File",
+        description="Path to the sound file to insert",
+        subtype='FILE_PATH',
         default="",
+    )
+    
+    volume_slowest: FloatProperty(
+        name="Slowest Volume",
+        description="Volume for the slowest Z-crossings",
+        default=0.3,
+        min=0.0,
+        max=1.0,
+        subtype='FACTOR',
+    )
+    
+    volume_fastest: FloatProperty(
+        name="Fastest Volume",
+        description="Volume for the fastest Z-crossings",
+        default=1.0,
+        min=0.0,
+        max=1.0,
+        subtype='FACTOR',
     )
     
     volume_randomness: FloatProperty(
         name="Volume Randomness",
-        description="Amount of random variation in volume (0 = no variation, 1 = full range from 0 to 1)",
+        description="Random variation applied after speed-based volume (0 = no variation, 1 = can reduce to 0)",
         default=0.2,
         min=0.0,
         max=1.0,
@@ -119,21 +137,16 @@ class VSE_PG_EventSoundSettings(PropertyGroup):
     )
 
 
-SUPPORTED_AUDIO_EXTENSIONS = {'.wav', '.mp3', '.ogg', '.flac', '.aiff', '.aif'}
-
-
-def get_sound_files_from_folder(folder_path):
-    """Get all supported audio files from a folder."""
-    if not folder_path or not os.path.isdir(folder_path):
-        return []
+def apply_strip_color_by_channel(strip, channel):
+    """Apply a color tag to a strip based on the channel number.
     
-    sound_files = []
-    for filename in os.listdir(folder_path):
-        ext = os.path.splitext(filename)[1].lower()
-        if ext in SUPPORTED_AUDIO_EXTENSIONS:
-            sound_files.append(os.path.join(folder_path, filename))
-    
-    return sorted(sound_files)
+    Each import batch gets a unique color based on its starting channel.
+    """
+    # Blender 4.0+ uses color_tag (enum) with COLOR_01 through COLOR_09
+    if hasattr(strip, 'color_tag'):
+        # Use channel to determine color (cycling through 9 colors)
+        tag_index = ((channel - 1) % 9) + 1  # COLOR_01 to COLOR_09
+        strip.color_tag = f'COLOR_{tag_index:02d}'
 
 
 def get_random_volume(base_volume, randomness):
@@ -194,6 +207,26 @@ def get_all_strips(sed):
     elif hasattr(sed, 'sequences'):
         return list(sed.sequences)
     return []
+
+
+def find_first_empty_channel(sed):
+    """Find the first channel that has no strips at all.
+    
+    Returns the lowest channel number that is completely empty.
+    """
+    all_strips = get_all_strips(sed)
+    if not all_strips:
+        return 1
+    
+    # Get all channels that have strips
+    used_channels = set(s.channel for s in all_strips)
+    
+    # Find the first empty channel starting from 1
+    channel = 1
+    while channel in used_channels:
+        channel += 1
+    
+    return channel
 
 
 def strips_overlap(strip1, strip2):
@@ -295,19 +328,17 @@ class VSE_OT_AddSoundsAtZCrossings(Operator):
             self.report({'ERROR'}, f"'{armature_name}' is not an armature")
             return {'CANCELLED'}
         
-        # Get sound files from folder
-        sound_folder = bpy.path.abspath(settings.sound_folder)
-        sound_files = get_sound_files_from_folder(sound_folder)
+        # Get the sound file path
+        sound_path = bpy.path.abspath(settings.sound_file)
         
-        # Fall back to default bundled sound if no folder or no sounds found
-        if not sound_files:
+        # Fall back to default bundled sound if no file selected
+        if not sound_path or not os.path.exists(sound_path):
             addon_dir = os.path.dirname(os.path.realpath(__file__))
-            default_sound = os.path.join(addon_dir, "geiger_counter_sound.wav")
-            if os.path.exists(default_sound):
-                sound_files = [default_sound]
-            else:
-                self.report({'ERROR'}, "No sound files found. Please select a folder with audio files.")
-                return {'CANCELLED'}
+            sound_path = os.path.join(addon_dir, "geiger_counter_sound.wav")
+        
+        if not os.path.exists(sound_path):
+            self.report({'ERROR'}, f"Sound file not found: {sound_path}")
+            return {'CANCELLED'}
         
         # Get timeline range
         scene = context.scene
@@ -332,8 +363,9 @@ class VSE_OT_AddSoundsAtZCrossings(Operator):
             self.report({'ERROR'}, "No valid pose bones found")
             return {'CANCELLED'}
         
-        # Find all Z-crossing frames
-        crossing_frames = set()
+        # Find all Z-crossing frames with their crossing speeds
+        # Dict: frame -> max speed at that frame (in case multiple bones cross)
+        crossing_data = {}
         
         # Track previous Z positions for each bone
         prev_z = {bone.name: None for bone in pose_bones}
@@ -362,7 +394,11 @@ class VSE_OT_AddSoundsAtZCrossings(Operator):
                         crossed = bone_prev_z > threshold and world_z <= threshold
                     
                     if crossed:
-                        crossing_frames.add(frame)
+                        # Calculate crossing speed (absolute Z delta per frame)
+                        crossing_speed = abs(world_z - bone_prev_z)
+                        # Keep the maximum speed if multiple bones cross at the same frame
+                        if frame not in crossing_data or crossing_speed > crossing_data[frame]:
+                            crossing_data[frame] = crossing_speed
                 
                 prev_z[pose_bone.name] = world_z
         
@@ -371,12 +407,16 @@ class VSE_OT_AddSoundsAtZCrossings(Operator):
         
         source_name = f"bones in '{bone_collection_name}'" if bone_collection_name != 'ALL' else "all bones"
         
-        if not crossing_frames:
+        if not crossing_data:
             self.report({'WARNING'}, f"No Z crossings found for {source_name}")
             return {'CANCELLED'}
         
-        # Sort frames
-        crossing_frames = sorted(crossing_frames)
+        # Sort frames and normalize speeds
+        crossing_frames = sorted(crossing_data.keys())
+        speeds = [crossing_data[f] for f in crossing_frames]
+        max_speed = max(speeds) if speeds else 1.0
+        min_speed = min(speeds) if speeds else 0.0
+        speed_range = max_speed - min_speed if max_speed > min_speed else 1.0
         
         # Get the correct scene for the sequencer
         seq_scene = get_sequencer_scene(context)
@@ -387,63 +427,79 @@ class VSE_OT_AddSoundsAtZCrossings(Operator):
         
         sed = seq_scene.sequence_editor
         
-        # Find an available channel
-        channel = 1
-        try:
-            all_strips = get_all_strips(sed)
-            if all_strips and len(all_strips) > 0:
-                channel = max(s.channel for s in all_strips) + 1
-        except Exception:
-            channel = 1
+        # Find the first completely empty channel for this import batch
+        base_channel = find_first_empty_channel(sed)
         
-        # Insert sounds at crossing frames with random sound selection and volume
+        # Insert sounds at crossing frames with speed-based volume
         inserted_count = 0
         new_strips = []
+        volume_slowest = settings.volume_slowest
+        volume_fastest = settings.volume_fastest
         volume_randomness = settings.volume_randomness
         
         for frame in crossing_frames:
             try:
-                # Pick a random sound from the folder
-                sound_path = random.choice(sound_files)
-                
                 strip = add_sound_strip(
                     sed,
                     name=f"ZCross_{frame}",
                     filepath=sound_path,
-                    channel=channel,
+                    channel=base_channel,
                     frame_start=frame
                 )
                 
-                # Apply random volume
+                # Apply color based on the base channel (each import batch gets one color)
+                apply_strip_color_by_channel(strip, base_channel)
+                
+                # Calculate speed-based volume (faster crossing = louder)
+                # Normalize speed to 0-1 range
+                crossing_speed = crossing_data[frame]
+                if speed_range > 0:
+                    # Normalize: 0 = slowest, 1 = fastest
+                    normalized_speed = (crossing_speed - min_speed) / speed_range
+                else:
+                    normalized_speed = 1.0
+                
+                # Map to user-defined volume range
+                base_volume = volume_slowest + (normalized_speed * (volume_fastest - volume_slowest))
+                
+                # Apply random variation afterwards
                 if hasattr(strip, 'volume'):
-                    strip.volume = get_random_volume(1.0, volume_randomness)
+                    strip.volume = get_random_volume(base_volume, volume_randomness)
                 
                 new_strips.append(strip)
                 inserted_count += 1
             except Exception as e:
                 self.report({'WARNING'}, f"Failed to add strip at frame {frame}: {e}")
         
-        # Separate overlapping strips onto different channels
+        # Separate overlapping strips onto different channels (starting from base_channel)
         if new_strips:
-            separate_overlapping_strips(new_strips, channel)
+            separate_overlapping_strips(new_strips, base_channel)
+            # Apply the same color to all strips (they may have moved to different channels)
+            for strip in new_strips:
+                apply_strip_color_by_channel(strip, base_channel)
         
-        self.report({'INFO'}, f"Added {inserted_count} sounds at Z-crossing frames")
+        self.report({'INFO'}, f"Added {inserted_count} sounds at Z-crossing frames (channel {base_channel}+)")
         return {'FINISHED'}
 
 
-class VSE_OT_SelectSoundFolder(Operator):
-    """Open file browser to select a folder containing sound files"""
-    bl_idname = "vse_event.select_sound_folder"
-    bl_label = "Select Sound Folder"
+class VSE_OT_SelectSoundFile(Operator):
+    """Open file browser to select a sound file"""
+    bl_idname = "vse_event.select_sound_file"
+    bl_label = "Select Sound File"
     bl_options = {'REGISTER'}
     
-    directory: StringProperty(
-        subtype='DIR_PATH',
+    filepath: StringProperty(
+        subtype='FILE_PATH',
         default="",
     )
     
+    filter_glob: StringProperty(
+        default="*.wav;*.mp3;*.ogg;*.flac;*.aiff;*.aif",
+        options={'HIDDEN'},
+    )
+    
     def execute(self, context):
-        context.scene.vse_event_sound_settings.sound_folder = self.directory
+        context.scene.vse_event_sound_settings.sound_file = self.filepath
         return {'FINISHED'}
     
     def invoke(self, context, event):
@@ -460,19 +516,17 @@ class VSE_OT_InsertEventSound(Operator):
     def execute(self, context):
         settings = context.scene.vse_event_sound_settings
         
-        # Get sound files from folder
-        sound_folder = bpy.path.abspath(settings.sound_folder)
-        sound_files = get_sound_files_from_folder(sound_folder)
+        # Get the sound file path
+        sound_path = bpy.path.abspath(settings.sound_file)
         
-        # Fall back to default bundled sound if no folder or no sounds found
-        if not sound_files:
+        # Fall back to default bundled sound if no file selected
+        if not sound_path or not os.path.exists(sound_path):
             addon_dir = os.path.dirname(os.path.realpath(__file__))
-            default_sound = os.path.join(addon_dir, "geiger_counter_sound.wav")
-            if os.path.exists(default_sound):
-                sound_files = [default_sound]
-            else:
-                self.report({'ERROR'}, "No sound files found. Please select a folder with audio files.")
-                return {'CANCELLED'}
+            sound_path = os.path.join(addon_dir, "geiger_counter_sound.wav")
+
+        if not os.path.exists(sound_path):
+            self.report({'ERROR'}, f"Sound file not found: {sound_path}")
+            return {'CANCELLED'}
 
         # Get the correct scene for the sequencer
         scene = get_sequencer_scene(context)
@@ -483,15 +537,8 @@ class VSE_OT_InsertEventSound(Operator):
 
         sed = scene.sequence_editor
 
-        # Find an available channel - start at 1
-        channel = 1
-        try:
-            all_strips = get_all_strips(sed)
-            if all_strips and len(all_strips) > 0:
-                channel = max(s.channel for s in all_strips) + 1
-        except Exception:
-            # If anything fails, just use channel 1
-            channel = 1
+        # Find the first completely empty channel for this import batch
+        base_channel = find_first_empty_channel(sed)
 
         # Get the current frame as starting point
         current_frame = scene.frame_current
@@ -509,9 +556,6 @@ class VSE_OT_InsertEventSound(Operator):
 
         for i in range(repeat_count):
             try:
-                # Pick a random sound from the folder
-                sound_path = random.choice(sound_files)
-                
                 # For strip creation, we need an integer frame
                 # We'll create at the integer position then adjust if using subframe
                 create_frame = int(frame_position) if use_subframe else int(round(frame_position))
@@ -521,9 +565,12 @@ class VSE_OT_InsertEventSound(Operator):
                     sed,
                     name=f"EventSound_{i+1}",
                     filepath=sound_path,
-                    channel=channel,
+                    channel=base_channel,
                     frame_start=create_frame
                 )
+                
+                # Apply color based on the base channel (each import batch gets one color)
+                apply_strip_color_by_channel(strip, base_channel)
                 
                 # Apply random volume
                 if hasattr(strip, 'volume'):
@@ -577,35 +624,30 @@ class VSE_PT_EventSoundsPanel(Panel):
         layout = self.layout
         settings = context.scene.vse_event_sound_settings
         
-        # Sound folder selection
+        # Sound file selection
         row = layout.row(align=True)
-        row.label(text="Sound Folder:", icon='FILE_FOLDER')
-        
-        # Show folder info
-        sound_folder = bpy.path.abspath(settings.sound_folder)
-        sound_files = get_sound_files_from_folder(sound_folder)
-        
-        if sound_files:
-            row = layout.row()
-            row.label(text=f"{len(sound_files)} sounds found", icon='SOUND')
-        elif settings.sound_folder:
-            row = layout.row()
-            row.label(text="No audio files found", icon='ERROR')
+        row.label(text="Sound:", icon='SOUND')
+        if settings.sound_file:
+            filename = os.path.basename(settings.sound_file)
+            row.label(text=filename)
         else:
-            row = layout.row()
-            row.label(text="Using default sound", icon='INFO')
+            row.label(text="Default")
         
         layout.operator(
-            "vse_event.select_sound_folder",
-            text="Select Folder...",
+            "vse_event.select_sound_file",
+            text="Browse...",
             icon='FILEBROWSER'
         )
         
         layout.separator()
         
-        # Volume randomness slider
+        # Volume settings
         col = layout.column(align=True)
-        col.label(text="Volume Variation:", icon='SPEAKER')
+        col.label(text="Volume (Speed-Based):", icon='SPEAKER')
+        col.prop(settings, "volume_slowest", text="Slowest", slider=True)
+        col.prop(settings, "volume_fastest", text="Fastest", slider=True)
+        
+        col.separator()
         col.prop(settings, "volume_randomness", text="Randomness", slider=True)
 
 
@@ -689,9 +731,11 @@ class VSE_PT_ZCrossingPanel(Panel):
         )
         
         # Info
-        row = layout.row()
-        row.alignment = 'CENTER'
-        row.label(text="Triggers at Z=0.1 crossings")
+        box = layout.box()
+        col = box.column(align=True)
+        col.scale_y = 0.8
+        col.label(text="Triggers at Z=0.1 crossings")
+        col.label(text="Faster crossings = louder")
 
 
 def register():
