@@ -14,7 +14,17 @@
 import bpy
 import os
 from bpy.types import Panel, PropertyGroup, Operator
-from bpy.props import PointerProperty, StringProperty, IntProperty
+from bpy.props import PointerProperty, StringProperty, IntProperty, FloatProperty, BoolProperty, EnumProperty
+
+
+def get_collections(self, context):
+    """Return a list of collections for the enum property."""
+    items = []
+    for i, col in enumerate(bpy.data.collections):
+        items.append((col.name, col.name, f"Collection: {col.name}", 'OUTLINER_COLLECTION', i))
+    if not items:
+        items.append(('NONE', "No Collections", "No collections available", 'ERROR', 0))
+    return items
 
 
 class VSE_PG_EventSoundSettings(PropertyGroup):
@@ -35,11 +45,37 @@ class VSE_PG_EventSoundSettings(PropertyGroup):
         max=1000,
     )
     
-    frame_offset: IntProperty(
+    frame_offset: FloatProperty(
         name="Frame Offset",
-        description="Number of frames between each sound (0 = back to back)",
-        default=24,
-        min=0,
+        description="Number of frames between each sound (0 = back to back). Supports sub-frame values.",
+        default=24.0,
+        min=0.0,
+        precision=3,
+        step=100,  # Step of 1.0 in the UI
+    )
+    
+    use_subframe: BoolProperty(
+        name="Sub-frame Positioning",
+        description="Enable sub-frame (fractional) positioning for precise timing",
+        default=False,
+    )
+    
+    # Collection Z-crossing settings
+    z_crossing_collection: EnumProperty(
+        name="Collection",
+        description="Collection to monitor for Z=0 crossings",
+        items=get_collections,
+    )
+    
+    z_crossing_direction: EnumProperty(
+        name="Direction",
+        description="Which direction of crossing to detect",
+        items=[
+            ('BOTH', "Both", "Trigger on both upward and downward crossings"),
+            ('UP', "Upward", "Trigger only when crossing from negative to positive Z"),
+            ('DOWN', "Downward", "Trigger only when crossing from positive to negative Z"),
+        ],
+        default='BOTH',
     )
 
 
@@ -86,6 +122,130 @@ def get_all_strips(sed):
     elif hasattr(sed, 'sequences'):
         return list(sed.sequences)
     return []
+
+
+class VSE_OT_AddSoundsAtZCrossings(Operator):
+    """Scan timeline for objects crossing Z=0 and add sounds at those frames"""
+    bl_idname = "vse_event.add_sounds_at_z_crossings"
+    bl_label = "Add Sounds at Z Crossings"
+    bl_options = {'REGISTER', 'UNDO'}
+    
+    def execute(self, context):
+        settings = context.scene.vse_event_sound_settings
+        collection_name = settings.z_crossing_collection
+        direction = settings.z_crossing_direction
+        
+        # Check if collection exists
+        if collection_name == 'NONE' or collection_name not in bpy.data.collections:
+            self.report({'ERROR'}, "Please select a valid collection")
+            return {'CANCELLED'}
+        
+        collection = bpy.data.collections[collection_name]
+        
+        # Get all objects in the collection (including nested)
+        def get_all_objects_in_collection(col):
+            objects = list(col.objects)
+            for child_col in col.children:
+                objects.extend(get_all_objects_in_collection(child_col))
+            return objects
+        
+        objects = get_all_objects_in_collection(collection)
+        
+        if not objects:
+            self.report({'ERROR'}, f"Collection '{collection_name}' has no objects")
+            return {'CANCELLED'}
+        
+        # Get the sound file path
+        sound_path = bpy.path.abspath(settings.sound_file)
+        if not sound_path or not os.path.exists(sound_path):
+            addon_dir = os.path.dirname(os.path.realpath(__file__))
+            sound_path = os.path.join(addon_dir, "geiger_counter_sound.wav")
+        
+        if not os.path.exists(sound_path):
+            self.report({'ERROR'}, f"Sound file not found: {sound_path}")
+            return {'CANCELLED'}
+        
+        # Get timeline range
+        scene = context.scene
+        frame_start = scene.frame_start
+        frame_end = scene.frame_end
+        
+        # Store current frame to restore later
+        original_frame = scene.frame_current
+        
+        # Find all Z-crossing frames
+        crossing_frames = set()
+        
+        for obj in objects:
+            prev_z = None
+            
+            for frame in range(frame_start, frame_end + 1):
+                scene.frame_set(frame)
+                
+                # Get world-space Z position
+                world_z = obj.matrix_world.translation.z
+                
+                if prev_z is not None:
+                    # Check for crossing
+                    crossed = False
+                    
+                    if direction == 'BOTH':
+                        crossed = (prev_z < 0 and world_z >= 0) or (prev_z > 0 and world_z <= 0)
+                    elif direction == 'UP':
+                        crossed = prev_z < 0 and world_z >= 0
+                    elif direction == 'DOWN':
+                        crossed = prev_z > 0 and world_z <= 0
+                    
+                    if crossed:
+                        crossing_frames.add(frame)
+                
+                prev_z = world_z
+        
+        # Restore original frame
+        scene.frame_set(original_frame)
+        
+        if not crossing_frames:
+            self.report({'WARNING'}, f"No Z=0 crossings found for objects in '{collection_name}'")
+            return {'CANCELLED'}
+        
+        # Sort frames
+        crossing_frames = sorted(crossing_frames)
+        
+        # Get the correct scene for the sequencer
+        seq_scene = get_sequencer_scene(context)
+        
+        # Make sure we have a sequence editor
+        if not seq_scene.sequence_editor:
+            seq_scene.sequence_editor_create()
+        
+        sed = seq_scene.sequence_editor
+        
+        # Find an available channel
+        channel = 1
+        try:
+            all_strips = get_all_strips(sed)
+            if all_strips and len(all_strips) > 0:
+                channel = max(s.channel for s in all_strips) + 1
+        except Exception:
+            channel = 1
+        
+        # Insert sounds at crossing frames
+        inserted_count = 0
+        for frame in crossing_frames:
+            try:
+                strip = add_sound_strip(
+                    sed,
+                    name=f"ZCross_{frame}",
+                    filepath=sound_path,
+                    channel=channel,
+                    frame_start=frame
+                )
+                inserted_count += 1
+            except Exception as e:
+                self.report({'WARNING'}, f"Failed to add strip at frame {frame}: {e}")
+        
+        self.report({'INFO'}, f"Added {inserted_count} sounds at Z-crossing frames")
+        return {'FINISHED'}
 
 
 class VSE_OT_SelectSoundFile(Operator):
@@ -160,26 +320,36 @@ class VSE_OT_InsertEventSound(Operator):
         # Get settings
         repeat_count = settings.repeat_count
         custom_offset = settings.frame_offset
+        use_subframe = settings.use_subframe
 
         # Insert the sound strips
         inserted_count = 0
-        frame_position = current_frame
+        frame_position = float(current_frame)
         sound_length = None
 
         for i in range(repeat_count):
             try:
+                # For strip creation, we need an integer frame
+                # We'll create at the integer position then adjust if using subframe
+                create_frame = int(frame_position) if use_subframe else int(round(frame_position))
+                
                 # Add the sound strip
                 strip = add_sound_strip(
                     sed,
                     name=f"EventSound_{i+1}",
                     filepath=sound_path,
                     channel=channel,
-                    frame_start=frame_position
+                    frame_start=create_frame
                 )
+                
+                # Apply sub-frame offset if enabled
+                # Note: frame_start can be set to float after creation
+                if use_subframe and hasattr(strip, 'frame_start'):
+                    strip.frame_start = frame_position
                 
                 # Calculate sound length from first strip
                 if sound_length is None:
-                    if hasattr(strip, 'frame_final_end'):
+                    if hasattr(strip, 'frame_final_end') and hasattr(strip, 'frame_final_start'):
                         sound_length = strip.frame_final_end - strip.frame_final_start
                     elif hasattr(strip, 'frame_end'):
                         sound_length = strip.frame_end - strip.frame_start
@@ -188,14 +358,14 @@ class VSE_OT_InsertEventSound(Operator):
                 
                 # Move to next position based on offset setting
                 if custom_offset > 0:
-                    # Use custom frame offset
+                    # Use custom frame offset (can be fractional)
                     frame_position += custom_offset
                 else:
                     # Back to back (use sound length)
                     if hasattr(strip, 'frame_final_end'):
-                        frame_position = strip.frame_final_end
+                        frame_position = float(strip.frame_final_end)
                     elif hasattr(strip, 'frame_end'):
-                        frame_position = strip.frame_end
+                        frame_position = float(strip.frame_end)
                     else:
                         frame_position += sound_length
                     
@@ -209,7 +379,7 @@ class VSE_OT_InsertEventSound(Operator):
 
 
 class VSE_PT_EventSoundsPanel(Panel):
-    """Panel in the N-panel of the 3D Viewport"""
+    """Main panel in the N-panel of the 3D Viewport"""
     bl_label = "Event Sounds"
     bl_idname = "VSE_PT_event_sounds_panel"
     bl_space_type = 'VIEW_3D'
@@ -220,51 +390,107 @@ class VSE_PT_EventSoundsPanel(Panel):
         layout = self.layout
         settings = context.scene.vse_event_sound_settings
         
-        # Sound file selection
-        box = layout.box()
-        box.label(text="Sound File:", icon='SOUND')
-        
+        # Sound file selection - compact header
+        row = layout.row(align=True)
+        row.label(text="Sound:", icon='SOUND')
         if settings.sound_file:
-            # Show current file name
             filename = os.path.basename(settings.sound_file)
-            box.label(text=filename)
+            row.label(text=filename)
         else:
-            box.label(text="(Using default sound)")
+            row.label(text="Default")
         
-        box.operator(
+        layout.operator(
             "vse_event.select_sound_file",
-            text="Select Sound File",
+            text="Browse...",
             icon='FILEBROWSER'
         )
+
+
+class VSE_PT_RepeatSoundsPanel(Panel):
+    """Sub-panel for repeating sounds at intervals"""
+    bl_label = "Repeat at Interval"
+    bl_idname = "VSE_PT_repeat_sounds_panel"
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = "Event Sounds"
+    bl_parent_id = "VSE_PT_event_sounds_panel"
+
+    def draw(self, context):
+        layout = self.layout
+        settings = context.scene.vse_event_sound_settings
+        
+        # Compact settings
+        col = layout.column(align=True)
+        
+        row = col.row(align=True)
+        row.prop(settings, "repeat_count", text="Count")
+        
+        row = col.row(align=True)
+        row.prop(settings, "frame_offset", text="Interval")
         
         layout.separator()
         
-        # Settings
-        box = layout.box()
-        box.label(text="Settings:", icon='SETTINGS')
-        col = box.column(align=True)
-        col.prop(settings, "repeat_count", text="Repeat Count")
-        col.prop(settings, "frame_offset", text="Frame Offset")
-        
-        # Info about frame offset
-        if settings.frame_offset == 0:
-            box.label(text="(Back to back)", icon='INFO')
-        else:
-            box.label(text=f"(Every {settings.frame_offset} frames)", icon='INFO')
-        
-        layout.separator()
-        
-        # Main button to insert sounds
-        layout.operator(
+        # Main button
+        row = layout.row(align=True)
+        row.scale_y = 1.3
+        row.operator(
             VSE_OT_InsertEventSound.bl_idname,
-            text=f"Insert {settings.repeat_count}x Sound",
-            icon='SPEAKER'
+            text=f"Insert {settings.repeat_count} Sounds",
+            icon='ADD'
         )
         
-        # Info about where sounds will be inserted
-        box = layout.box()
-        box.label(text="Inserts into the VSE", icon='SEQUENCE')
-        box.label(text="starting at playhead")
+        # Compact info
+        row = layout.row()
+        row.alignment = 'CENTER'
+        if settings.frame_offset == 0:
+            row.label(text="Back-to-back from playhead")
+        else:
+            row.label(text=f"Every {settings.frame_offset:.1f}f from playhead")
+
+
+class VSE_PT_ZCrossingPanel(Panel):
+    """Sub-panel for Z-crossing sound triggers"""
+    bl_label = "Trigger on Z-Crossing"
+    bl_idname = "VSE_PT_z_crossing_panel"
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = "Event Sounds"
+    bl_parent_id = "VSE_PT_event_sounds_panel"
+
+    def draw(self, context):
+        layout = self.layout
+        settings = context.scene.vse_event_sound_settings
+        
+        # Collection selector - compact
+        col = layout.column(align=True)
+        
+        row = col.row(align=True)
+        row.label(text="Collection:", icon='OUTLINER_COLLECTION')
+        row = col.row(align=True)
+        row.prop(settings, "z_crossing_collection", text="")
+        
+        col.separator()
+        
+        row = col.row(align=True)
+        row.label(text="Direction:", icon='SORT_DESC')
+        row = col.row(align=True)
+        row.prop(settings, "z_crossing_direction", text="")
+        
+        layout.separator()
+        
+        # Main button
+        row = layout.row(align=True)
+        row.scale_y = 1.3
+        row.operator(
+            VSE_OT_AddSoundsAtZCrossings.bl_idname,
+            text="Add Sounds at Crossings",
+            icon='ADD'
+        )
+        
+        # Compact info
+        row = layout.row()
+        row.alignment = 'CENTER'
+        row.label(text="Scans timeline for Z=0 crossings")
 
 
 def register():
