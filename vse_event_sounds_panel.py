@@ -13,6 +13,7 @@
 
 import bpy
 import os
+import random
 from bpy.types import Panel, PropertyGroup, Operator
 from bpy.props import PointerProperty, StringProperty, IntProperty, FloatProperty, BoolProperty, EnumProperty
 
@@ -54,11 +55,20 @@ def get_bone_collections(self, context):
 class VSE_PG_EventSoundSettings(PropertyGroup):
     """Property group for event sound settings."""
     
-    sound_file: StringProperty(
-        name="Sound File",
-        description="Path to the sound file to insert",
-        subtype='FILE_PATH',
+    sound_folder: StringProperty(
+        name="Sound Folder",
+        description="Path to folder containing sound files (wav, mp3, ogg, flac, aiff)",
+        subtype='DIR_PATH',
         default="",
+    )
+    
+    volume_randomness: FloatProperty(
+        name="Volume Randomness",
+        description="Amount of random variation in volume (0 = no variation, 1 = full range from 0 to 1)",
+        default=0.2,
+        min=0.0,
+        max=1.0,
+        subtype='FACTOR',
     )
     
     repeat_count: IntProperty(
@@ -107,6 +117,38 @@ class VSE_PG_EventSoundSettings(PropertyGroup):
         ],
         default='BOTH',
     )
+
+
+SUPPORTED_AUDIO_EXTENSIONS = {'.wav', '.mp3', '.ogg', '.flac', '.aiff', '.aif'}
+
+
+def get_sound_files_from_folder(folder_path):
+    """Get all supported audio files from a folder."""
+    if not folder_path or not os.path.isdir(folder_path):
+        return []
+    
+    sound_files = []
+    for filename in os.listdir(folder_path):
+        ext = os.path.splitext(filename)[1].lower()
+        if ext in SUPPORTED_AUDIO_EXTENSIONS:
+            sound_files.append(os.path.join(folder_path, filename))
+    
+    return sorted(sound_files)
+
+
+def get_random_volume(base_volume, randomness):
+    """Calculate a random volume based on randomness factor.
+    
+    With randomness=0, returns base_volume.
+    With randomness=1, returns a value between 0 and base_volume.
+    """
+    if randomness <= 0:
+        return base_volume
+    
+    # Calculate the minimum volume based on randomness
+    # At randomness=1, min_volume=0. At randomness=0, min_volume=base_volume
+    min_volume = base_volume * (1.0 - randomness)
+    return random.uniform(min_volume, base_volume)
 
 
 def get_sequencer_scene(context):
@@ -253,15 +295,19 @@ class VSE_OT_AddSoundsAtZCrossings(Operator):
             self.report({'ERROR'}, f"'{armature_name}' is not an armature")
             return {'CANCELLED'}
         
-        # Get the sound file path
-        sound_path = bpy.path.abspath(settings.sound_file)
-        if not sound_path or not os.path.exists(sound_path):
-            addon_dir = os.path.dirname(os.path.realpath(__file__))
-            sound_path = os.path.join(addon_dir, "geiger_counter_sound.wav")
+        # Get sound files from folder
+        sound_folder = bpy.path.abspath(settings.sound_folder)
+        sound_files = get_sound_files_from_folder(sound_folder)
         
-        if not os.path.exists(sound_path):
-            self.report({'ERROR'}, f"Sound file not found: {sound_path}")
-            return {'CANCELLED'}
+        # Fall back to default bundled sound if no folder or no sounds found
+        if not sound_files:
+            addon_dir = os.path.dirname(os.path.realpath(__file__))
+            default_sound = os.path.join(addon_dir, "geiger_counter_sound.wav")
+            if os.path.exists(default_sound):
+                sound_files = [default_sound]
+            else:
+                self.report({'ERROR'}, "No sound files found. Please select a folder with audio files.")
+                return {'CANCELLED'}
         
         # Get timeline range
         scene = context.scene
@@ -350,11 +396,16 @@ class VSE_OT_AddSoundsAtZCrossings(Operator):
         except Exception:
             channel = 1
         
-        # Insert sounds at crossing frames
+        # Insert sounds at crossing frames with random sound selection and volume
         inserted_count = 0
         new_strips = []
+        volume_randomness = settings.volume_randomness
+        
         for frame in crossing_frames:
             try:
+                # Pick a random sound from the folder
+                sound_path = random.choice(sound_files)
+                
                 strip = add_sound_strip(
                     sed,
                     name=f"ZCross_{frame}",
@@ -362,6 +413,11 @@ class VSE_OT_AddSoundsAtZCrossings(Operator):
                     channel=channel,
                     frame_start=frame
                 )
+                
+                # Apply random volume
+                if hasattr(strip, 'volume'):
+                    strip.volume = get_random_volume(1.0, volume_randomness)
+                
                 new_strips.append(strip)
                 inserted_count += 1
             except Exception as e:
@@ -375,24 +431,19 @@ class VSE_OT_AddSoundsAtZCrossings(Operator):
         return {'FINISHED'}
 
 
-class VSE_OT_SelectSoundFile(Operator):
-    """Open file browser to select a sound file"""
-    bl_idname = "vse_event.select_sound_file"
-    bl_label = "Select Sound File"
+class VSE_OT_SelectSoundFolder(Operator):
+    """Open file browser to select a folder containing sound files"""
+    bl_idname = "vse_event.select_sound_folder"
+    bl_label = "Select Sound Folder"
     bl_options = {'REGISTER'}
     
-    filepath: StringProperty(
-        subtype='FILE_PATH',
+    directory: StringProperty(
+        subtype='DIR_PATH',
         default="",
     )
     
-    filter_glob: StringProperty(
-        default="*.wav;*.mp3;*.ogg;*.flac;*.aiff;*.aif",
-        options={'HIDDEN'},
-    )
-    
     def execute(self, context):
-        context.scene.vse_event_sound_settings.sound_file = self.filepath
+        context.scene.vse_event_sound_settings.sound_folder = self.directory
         return {'FINISHED'}
     
     def invoke(self, context, event):
@@ -409,18 +460,19 @@ class VSE_OT_InsertEventSound(Operator):
     def execute(self, context):
         settings = context.scene.vse_event_sound_settings
         
-        # Get the sound file path
-        sound_path = bpy.path.abspath(settings.sound_file)
+        # Get sound files from folder
+        sound_folder = bpy.path.abspath(settings.sound_folder)
+        sound_files = get_sound_files_from_folder(sound_folder)
         
-        # If no custom sound file, use the default bundled one
-        if not sound_path or not os.path.exists(sound_path):
+        # Fall back to default bundled sound if no folder or no sounds found
+        if not sound_files:
             addon_dir = os.path.dirname(os.path.realpath(__file__))
-            sound_path = os.path.join(addon_dir, "geiger_counter_sound.wav")
-
-        # Check if the file exists
-        if not os.path.exists(sound_path):
-            self.report({'ERROR'}, f"Sound file not found: {sound_path}")
-            return {'CANCELLED'}
+            default_sound = os.path.join(addon_dir, "geiger_counter_sound.wav")
+            if os.path.exists(default_sound):
+                sound_files = [default_sound]
+            else:
+                self.report({'ERROR'}, "No sound files found. Please select a folder with audio files.")
+                return {'CANCELLED'}
 
         # Get the correct scene for the sequencer
         scene = get_sequencer_scene(context)
@@ -448,6 +500,7 @@ class VSE_OT_InsertEventSound(Operator):
         repeat_count = settings.repeat_count
         custom_offset = settings.frame_offset
         use_subframe = settings.use_subframe
+        volume_randomness = settings.volume_randomness
 
         # Insert the sound strips
         inserted_count = 0
@@ -456,6 +509,9 @@ class VSE_OT_InsertEventSound(Operator):
 
         for i in range(repeat_count):
             try:
+                # Pick a random sound from the folder
+                sound_path = random.choice(sound_files)
+                
                 # For strip creation, we need an integer frame
                 # We'll create at the integer position then adjust if using subframe
                 create_frame = int(frame_position) if use_subframe else int(round(frame_position))
@@ -468,6 +524,10 @@ class VSE_OT_InsertEventSound(Operator):
                     channel=channel,
                     frame_start=create_frame
                 )
+                
+                # Apply random volume
+                if hasattr(strip, 'volume'):
+                    strip.volume = get_random_volume(1.0, volume_randomness)
                 
                 # Apply sub-frame offset if enabled
                 # Note: frame_start can be set to float after creation
@@ -517,20 +577,36 @@ class VSE_PT_EventSoundsPanel(Panel):
         layout = self.layout
         settings = context.scene.vse_event_sound_settings
         
-        # Sound file selection - compact header
+        # Sound folder selection
         row = layout.row(align=True)
-        row.label(text="Sound:", icon='SOUND')
-        if settings.sound_file:
-            filename = os.path.basename(settings.sound_file)
-            row.label(text=filename)
+        row.label(text="Sound Folder:", icon='FILE_FOLDER')
+        
+        # Show folder info
+        sound_folder = bpy.path.abspath(settings.sound_folder)
+        sound_files = get_sound_files_from_folder(sound_folder)
+        
+        if sound_files:
+            row = layout.row()
+            row.label(text=f"{len(sound_files)} sounds found", icon='SOUND')
+        elif settings.sound_folder:
+            row = layout.row()
+            row.label(text="No audio files found", icon='ERROR')
         else:
-            row.label(text="Default")
+            row = layout.row()
+            row.label(text="Using default sound", icon='INFO')
         
         layout.operator(
-            "vse_event.select_sound_file",
-            text="Browse...",
+            "vse_event.select_sound_folder",
+            text="Select Folder...",
             icon='FILEBROWSER'
         )
+        
+        layout.separator()
+        
+        # Volume randomness slider
+        col = layout.column(align=True)
+        col.label(text="Volume Variation:", icon='SPEAKER')
+        col.prop(settings, "volume_randomness", text="Randomness", slider=True)
 
 
 class VSE_PT_RepeatSoundsPanel(Panel):
