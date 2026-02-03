@@ -15,7 +15,7 @@ import bpy
 import os
 import random
 from bpy.types import Panel, PropertyGroup, Operator
-from bpy.props import PointerProperty, StringProperty, IntProperty, FloatProperty, BoolProperty, EnumProperty
+from bpy.props import PointerProperty, StringProperty, FloatProperty, EnumProperty
 
 
 def get_armatures(self, context):
@@ -131,29 +131,6 @@ class VSE_PG_EventSoundSettings(PropertyGroup):
         min=0.0,
         max=1.0,
         subtype='FACTOR',
-    )
-    
-    repeat_count: IntProperty(
-        name="Repeat Count",
-        description="Number of times to insert the sound",
-        default=5,
-        min=1,
-        max=1000,
-    )
-    
-    frame_offset: FloatProperty(
-        name="Frame Offset",
-        description="Number of frames between each sound (0 = back to back). Supports sub-frame values.",
-        default=24.0,
-        min=0.0,
-        precision=3,
-        step=100,  # Step of 1.0 in the UI
-    )
-    
-    use_subframe: BoolProperty(
-        name="Sub-frame Positioning",
-        description="Enable sub-frame (fractional) positioning for precise timing",
-        default=False,
     )
     
     # Armature/Bone Collection settings
@@ -570,117 +547,6 @@ class VSE_OT_SelectSoundFolder(Operator):
         return {'RUNNING_MODAL'}
 
 
-class VSE_OT_InsertEventSound(Operator):
-    """Insert the event sound into the VSE"""
-    bl_idname = "sequencer.insert_event_sound"
-    bl_label = "Insert Event Sound"
-    bl_options = {'REGISTER', 'UNDO'}
-
-    def execute(self, context):
-        settings = context.scene.vse_event_sound_settings
-        
-        # Get the sound file path from folder + selected file
-        sound_folder = bpy.path.abspath(settings.sound_folder)
-        sound_filename = settings.sound_file
-        
-        if sound_folder and sound_filename and sound_filename != 'NONE':
-            sound_path = os.path.join(sound_folder, sound_filename)
-        else:
-            sound_path = None
-        
-        # Fall back to default bundled sound if no file selected
-        if not sound_path or not os.path.exists(sound_path):
-            addon_dir = os.path.dirname(os.path.realpath(__file__))
-            sound_path = os.path.join(addon_dir, "geiger_counter_sound.wav")
-
-        if not os.path.exists(sound_path):
-            self.report({'ERROR'}, f"Sound file not found: {sound_path}")
-            return {'CANCELLED'}
-
-        # Get the correct scene for the sequencer
-        scene = get_sequencer_scene(context)
-        
-        # Make sure we have a sequence editor
-        if not scene.sequence_editor:
-            scene.sequence_editor_create()
-
-        sed = scene.sequence_editor
-
-        # Find the first completely empty channel for this import batch
-        base_channel = find_next_available_channel(sed)
-
-        # Get the current frame as starting point
-        current_frame = scene.frame_current
-        
-        # Get settings
-        repeat_count = settings.repeat_count
-        custom_offset = settings.frame_offset
-        use_subframe = settings.use_subframe
-        volume_randomness = settings.volume_randomness
-
-        # Insert the sound strips
-        inserted_count = 0
-        frame_position = float(current_frame)
-        sound_length = None
-
-        for i in range(repeat_count):
-            try:
-                # For strip creation, we need an integer frame
-                # We'll create at the integer position then adjust if using subframe
-                create_frame = int(frame_position) if use_subframe else int(round(frame_position))
-                
-                # Add the sound strip
-                strip = add_sound_strip(
-                    sed,
-                    name=f"EventSound_{i+1}",
-                    filepath=sound_path,
-                    channel=base_channel,
-                    frame_start=create_frame
-                )
-                
-                # Apply color based on the base channel (each import batch gets one color)
-                apply_strip_color_by_channel(strip, base_channel)
-                
-                # Apply random volume
-                if hasattr(strip, 'volume'):
-                    strip.volume = get_random_volume(1.0, volume_randomness)
-                
-                # Apply sub-frame offset if enabled
-                # Note: frame_start can be set to float after creation
-                if use_subframe and hasattr(strip, 'frame_start'):
-                    strip.frame_start = frame_position
-                
-                # Calculate sound length from first strip
-                if sound_length is None:
-                    if hasattr(strip, 'frame_final_end') and hasattr(strip, 'frame_final_start'):
-                        sound_length = strip.frame_final_end - strip.frame_final_start
-                    elif hasattr(strip, 'frame_end'):
-                        sound_length = strip.frame_end - strip.frame_start
-                    else:
-                        sound_length = 48  # Fallback
-                
-                # Move to next position based on offset setting
-                if custom_offset > 0:
-                    # Use custom frame offset (can be fractional)
-                    frame_position += custom_offset
-                else:
-                    # Back to back (use sound length)
-                    if hasattr(strip, 'frame_final_end'):
-                        frame_position = float(strip.frame_final_end)
-                    elif hasattr(strip, 'frame_end'):
-                        frame_position = float(strip.frame_end)
-                    else:
-                        frame_position += sound_length
-                    
-                inserted_count += 1
-            except Exception as e:
-                self.report({'ERROR'}, f"Failed to add strip: {e}")
-                return {'CANCELLED'}
-
-        self.report({'INFO'}, f"Inserted {inserted_count} event sounds starting at frame {current_frame}")
-        return {'FINISHED'}
-
-
 class VSE_PT_EventSoundsPanel(Panel):
     """Main panel in the N-panel of the 3D Viewport"""
     bl_label = "Event Sounds"
@@ -727,48 +593,6 @@ class VSE_PT_EventSoundsPanel(Panel):
         
         col.separator()
         col.prop(settings, "volume_randomness", text="Randomness", slider=True)
-
-
-class VSE_PT_RepeatSoundsPanel(Panel):
-    """Sub-panel for repeating sounds at intervals"""
-    bl_label = "Repeat at Interval"
-    bl_idname = "VSE_PT_repeat_sounds_panel"
-    bl_space_type = 'VIEW_3D'
-    bl_region_type = 'UI'
-    bl_category = "Event Sounds"
-    bl_parent_id = "VSE_PT_event_sounds_panel"
-
-    def draw(self, context):
-        layout = self.layout
-        settings = context.scene.vse_event_sound_settings
-        
-        # Compact settings
-        col = layout.column(align=True)
-        
-        row = col.row(align=True)
-        row.prop(settings, "repeat_count", text="Count")
-        
-        row = col.row(align=True)
-        row.prop(settings, "frame_offset", text="Interval")
-        
-        layout.separator()
-        
-        # Main button
-        row = layout.row(align=True)
-        row.scale_y = 1.3
-        row.operator(
-            VSE_OT_InsertEventSound.bl_idname,
-            text=f"Insert {settings.repeat_count} Sounds",
-            icon='ADD'
-        )
-        
-        # Compact info
-        row = layout.row()
-        row.alignment = 'CENTER'
-        if settings.frame_offset == 0:
-            row.label(text="Back-to-back from playhead")
-        else:
-            row.label(text=f"Every {settings.frame_offset:.1f}f from playhead")
 
 
 class VSE_PT_ZCrossingPanel(Panel):
