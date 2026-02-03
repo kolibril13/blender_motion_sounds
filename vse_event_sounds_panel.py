@@ -100,6 +100,16 @@ class VSE_PG_EventSoundSettings(PropertyGroup):
         default="",
     )
     
+    sound_selection_mode: EnumProperty(
+        name="Sound Selection Mode",
+        description="How to select sounds for interaction events",
+        items=[
+            ('RANDOM', "Random Sound", "Randomly select a sound file from the folder for each event", 'FILE_REFRESH', 0),
+            ('SINGLE', "Single Sound", "Use one selected sound file for every event", 'SOUND', 1),
+        ],
+        default='RANDOM',
+    )
+    
     sound_file: EnumProperty(
         name="Sound File",
         description="Select a sound file from the folder",
@@ -359,21 +369,36 @@ class VSE_OT_AddSoundsAtZCrossings(Operator):
             self.report({'ERROR'}, f"'{armature_name}' is not an armature")
             return {'CANCELLED'}
         
-        # Get the sound file path from folder + selected file
+        # Get the sound folder and selection mode
         sound_folder = bpy.path.abspath(settings.sound_folder)
-        sound_filename = settings.sound_file
+        selection_mode = settings.sound_selection_mode
         
-        if sound_folder and sound_filename and sound_filename != 'NONE':
-            sound_path = os.path.join(sound_folder, sound_filename)
-        else:
-            sound_path = None
+        # For single mode, get the selected file
+        # For random mode, we'll get the list of available files
+        available_sound_files = []
+        sound_path = None
         
-        # Fall back to default bundled sound if no file selected
-        if not sound_path or not os.path.exists(sound_path):
+        if sound_folder and os.path.isdir(sound_folder):
+            available_sound_files = get_sound_files_from_folder(sound_folder)
+            
+            if selection_mode == 'SINGLE':
+                sound_filename = settings.sound_file
+                if sound_filename and sound_filename != 'NONE':
+                    sound_path = os.path.join(sound_folder, sound_filename)
+            elif selection_mode == 'RANDOM':
+                if not available_sound_files:
+                    self.report({'ERROR'}, "No sound files found in the selected folder")
+                    return {'CANCELLED'}
+                # We'll select randomly per event, so just validate folder has sounds
+                sound_path = "RANDOM_MODE"
+        
+        # Fall back to default bundled sound if no file selected (single mode only)
+        if selection_mode == 'SINGLE' and (not sound_path or not os.path.exists(sound_path)):
             addon_dir = os.path.dirname(os.path.realpath(__file__))
             sound_path = os.path.join(addon_dir, "geiger_counter_sound.wav")
         
-        if not os.path.exists(sound_path):
+        # Validate sound path exists (skip for random mode which was validated above)
+        if selection_mode == 'SINGLE' and not os.path.exists(sound_path):
             self.report({'ERROR'}, f"Sound file not found: {sound_path}")
             return {'CANCELLED'}
         
@@ -484,10 +509,16 @@ class VSE_OT_AddSoundsAtZCrossings(Operator):
         
         for frame in crossing_frames:
             try:
+                # Determine which sound file to use
+                if selection_mode == 'RANDOM' and available_sound_files:
+                    current_sound_path = os.path.join(sound_folder, random.choice(available_sound_files))
+                else:
+                    current_sound_path = sound_path
+                
                 strip = add_sound_strip(
                     sed,
                     name=f"ZCross_{frame}",
-                    filepath=sound_path,
+                    filepath=current_sound_path,
                     channel=base_channel,
                     frame_start=frame
                 )
@@ -576,12 +607,25 @@ class VSE_PT_EventSoundsPanel(Panel):
             icon='FILEBROWSER'
         )
         
-        # Sound file dropdown (only show if folder is selected)
+        # Sound selection mode and file dropdown (only show if folder is selected)
         if settings.sound_folder:
             layout.separator()
             col = layout.column(align=True)
-            col.label(text="Sound File:", icon='SOUND')
-            col.prop(settings, "sound_file", text="")
+            col.label(text="Sound Selection:", icon='SOUND')
+            row = col.row(align=True)
+            row.prop(settings, "sound_selection_mode", expand=True)
+            
+            # Only show sound file dropdown in single mode
+            if settings.sound_selection_mode == 'SINGLE':
+                col.separator()
+                col.label(text="Sound File:", icon='PLAY_SOUND')
+                col.prop(settings, "sound_file", text="")
+            else:
+                # Show info about random mode
+                col.separator()
+                folder_path = bpy.path.abspath(settings.sound_folder)
+                sound_count = len(get_sound_files_from_folder(folder_path))
+                col.label(text=f"Will use {sound_count} sound(s) randomly", icon='INFO')
         
         layout.separator()
         
