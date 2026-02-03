@@ -518,17 +518,6 @@ class VSE_OT_AddSoundsAtZCrossings(Operator):
                 else:
                     current_sound_path = sound_path
                 
-                strip = add_sound_strip(
-                    sed,
-                    name=f"{bone_name}_{frame}",
-                    filepath=current_sound_path,
-                    channel=base_channel,
-                    frame_start=frame
-                )
-                
-                # Apply color based on the base channel (each import batch gets one color)
-                apply_strip_color_by_channel(strip, base_channel)
-                
                 # Calculate speed-based volume (faster crossing = louder)
                 # Normalize speed to 0-1 range (crossing_speed already extracted above)
                 if speed_range > 0:
@@ -540,9 +529,26 @@ class VSE_OT_AddSoundsAtZCrossings(Operator):
                 # Map to user-defined volume range
                 base_volume = volume_slowest + (normalized_speed * (volume_fastest - volume_slowest))
                 
-                # Apply random variation afterwards
+                # Apply random variation
+                final_volume = get_random_volume(base_volume, volume_randomness)
+                
+                # Format volume as percentage for the name (e.g., 0.75 -> 75)
+                volume_percent = int(round(final_volume * 100))
+                
+                strip = add_sound_strip(
+                    sed,
+                    name=f"{bone_name}_{frame}_v{volume_percent}",
+                    filepath=current_sound_path,
+                    channel=base_channel,
+                    frame_start=frame
+                )
+                
+                # Apply color based on the base channel (each import batch gets one color)
+                apply_strip_color_by_channel(strip, base_channel)
+                
+                # Apply the calculated volume
                 if hasattr(strip, 'volume'):
-                    strip.volume = get_random_volume(base_volume, volume_randomness)
+                    strip.volume = final_volume
                 
                 new_strips.append(strip)
                 inserted_count += 1
