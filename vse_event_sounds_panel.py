@@ -537,7 +537,7 @@ class VSE_OT_AddSoundsAtZCrossings(Operator):
                 
                 strip = add_sound_strip(
                     sed,
-                    name=f"{bone_name}_{frame}_v{volume_percent}",
+                    name=f"{bone_name}_volume{volume_percent}",
                     filepath=current_sound_path,
                     channel=base_channel,
                     frame_start=frame
@@ -644,7 +644,7 @@ class VSE_PT_EventSoundsPanel(Panel):
         col.prop(settings, "volume_fastest", text="Fastest", slider=True)
         
         col.separator()
-        col.prop(settings, "volume_randomness", text="Randomness", slider=True)
+        col.prop(settings, "volume_randomness", text="Volume Randomness", slider=True)
 
 
 class VSE_PT_ZCrossingPanel(Panel):
