@@ -627,13 +627,13 @@ class VSE_OT_SelectSoundFolder(Operator):
         return {'RUNNING_MODAL'}
 
 
-class VSE_PT_EventSoundsPanel(Panel):
+class VSE_PT_MotionSoundsPanel(Panel):
     """Main panel in the N-panel of the 3D Viewport"""
-    bl_label = "Event Sounds"
-    bl_idname = "VSE_PT_event_sounds_panel"
+    bl_label = "Motion Sounds"
+    bl_idname = "VSE_PT_motion_sounds_panel"
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
-    bl_category = "Event Sounds"
+    bl_category = "Motion Sounds"
 
     def draw(self, context):
         layout = self.layout
@@ -694,8 +694,8 @@ class VSE_PT_ZCrossingPanel(Panel):
     bl_idname = "VSE_PT_z_crossing_panel"
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
-    bl_category = "Event Sounds"
-    bl_parent_id = "VSE_PT_event_sounds_panel"
+    bl_category = "Motion Sounds"
+    bl_parent_id = "VSE_PT_motion_sounds_panel"
 
     def draw(self, context):
         layout = self.layout
