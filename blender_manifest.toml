@@ -1,12 +1,11 @@
 schema_version = "1.0.0"
 
-# Example of manifest file for a Blender extension
-# Change the values according to your extension
-id = "enhanced_speaker"
-version = "1.0.0"
-name = "Enhanced Speaker"
-tagline = "This is another extension"
-maintainer = "Jan-Hendrik Müller"
+# Blender extension manifest
+id = "event_sounds_vse"
+version = "0.7.0"
+name = "Event Sounds VSE"
+tagline = "Insert event sounds into the Video Sequence Editor"
+maintainer = "Jan-hendrik Müller"
 # Supported types: "add-on", "theme"
 type = "add-on"
 
