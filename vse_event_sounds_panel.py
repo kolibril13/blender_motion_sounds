@@ -14,6 +14,7 @@
 import bpy
 import os
 import random
+import wave
 from bpy.types import Panel, PropertyGroup, Operator
 from bpy.props import PointerProperty, StringProperty, FloatProperty, EnumProperty
 
@@ -354,6 +355,355 @@ def separate_overlapping_strips(strips, base_channel):
             test_channel += 1
 
 
+# ── Shared helpers ───────────────────────────────────────────────────────────
+
+def get_bones_for_collection(armature_obj, bone_collection_name):
+    """Get list of bone names that belong to the specified bone collection."""
+    armature_data = armature_obj.data
+    bone_names = []
+
+    if bone_collection_name == 'ALL':
+        return [bone.name for bone in armature_obj.pose.bones]
+
+    if bone_collection_name == 'SELECTED':
+        selected_pose_bones = bpy.context.selected_pose_bones
+        if selected_pose_bones:
+            for pose_bone in selected_pose_bones:
+                if pose_bone.id_data.name == armature_data.name:
+                    bone_names.append(pose_bone.name)
+        return bone_names
+
+    # Blender 4.0+ uses bone collections
+    if hasattr(armature_data, 'collections'):
+        for bcol in armature_data.collections:
+            if bcol.name == bone_collection_name:
+                for bone in armature_data.bones:
+                    if hasattr(bone, 'collections') and bcol in bone.collections.values():
+                        bone_names.append(bone.name)
+                    elif hasattr(bcol, 'bones'):
+                        if bone.name in [b.name for b in bcol.bones]:
+                            bone_names.append(bone.name)
+                break
+
+    return bone_names
+
+
+def detect_z_crossings(scene, armature_obj, pose_bones, threshold, direction, frame_start, frame_end):
+    """Detect bone Z-crossings across the timeline.
+
+    Returns:
+        dict: frame -> (crossing_speed, bone_name) for the fastest crossing per frame
+    """
+    crossing_data = {}
+    prev_z = {bone.name: None for bone in pose_bones}
+
+    for frame in range(frame_start, frame_end + 1):
+        scene.frame_set(frame)
+        world_matrix = armature_obj.matrix_world
+
+        for pose_bone in pose_bones:
+            tail_world = world_matrix @ pose_bone.tail
+            world_z = tail_world.z
+            bone_prev_z = prev_z[pose_bone.name]
+
+            if bone_prev_z is not None:
+                if direction == 'BOTH':
+                    crossed = (bone_prev_z < threshold and world_z >= threshold) or \
+                              (bone_prev_z > threshold and world_z <= threshold)
+                elif direction == 'UP':
+                    crossed = bone_prev_z < threshold and world_z >= threshold
+                else:  # DOWN
+                    crossed = bone_prev_z > threshold and world_z <= threshold
+
+                if crossed:
+                    crossing_speed = abs(world_z - bone_prev_z)
+                    if frame not in crossing_data or crossing_speed > crossing_data[frame][0]:
+                        crossing_data[frame] = (crossing_speed, pose_bone.name)
+
+            prev_z[pose_bone.name] = world_z
+
+    return crossing_data
+
+
+# ── DaVinci Resolve integration ─────────────────────────────────────────────
+
+RESOLVE_MODULES = "/Library/Application Support/Blackmagic Design/DaVinci Resolve/Developer/Scripting/Modules"
+RESOLVE_LIB     = "/Applications/DaVinci Resolve/DaVinci Resolve.app/Contents/Libraries/Fusion"
+
+
+def get_audio_duration_seconds(filepath):
+    """Get audio file duration in seconds using the wave module for WAV files."""
+    ext = os.path.splitext(filepath)[1].lower()
+    if ext == '.wav':
+        try:
+            with wave.open(filepath, 'r') as wf:
+                return wf.getnframes() / wf.getframerate()
+        except Exception:
+            pass
+    # Fallback: try Blender's audio backend for non-WAV files
+    try:
+        import aud
+        length = aud.Sound(filepath).length
+        if length > 0:
+            return length
+    except Exception:
+        pass
+    # Fallback for non-WAV or on error: assume 1 second
+    return 1.0
+
+
+def connect_to_davinci_resolve():
+    """Connect to a running DaVinci Resolve instance.
+
+    Returns:
+        tuple: (resolve, project, timeline, media_pool)
+
+    Raises:
+        RuntimeError: If connection fails at any step
+    """
+    import sys as _sys
+
+    if RESOLVE_MODULES not in _sys.path:
+        _sys.path.append(RESOLVE_MODULES)
+    os.environ["RESOLVE_SCRIPT_API"] = RESOLVE_MODULES
+    os.environ["RESOLVE_SCRIPT_LIB"] = RESOLVE_LIB
+
+    try:
+        import DaVinciResolveScript as dvr_script
+    except ImportError:
+        raise RuntimeError(
+            "Could not import DaVinci Resolve scripting module. "
+            "Make sure DaVinci Resolve is installed."
+        )
+
+    resolve = dvr_script.scriptapp("Resolve")
+    if resolve is None:
+        raise RuntimeError("Could not connect to DaVinci Resolve. Is it running?")
+
+    project_manager = resolve.GetProjectManager()
+    project = project_manager.GetCurrentProject()
+    if project is None:
+        raise RuntimeError("No project open in DaVinci Resolve")
+
+    media_pool = project.GetMediaPool()
+
+    timeline = project.GetCurrentTimeline()
+    if timeline is None:
+        timeline = media_pool.CreateEmptyTimeline("BlenderMotionSounds")
+
+    return resolve, project, timeline, media_pool
+
+
+def find_next_available_audio_track(timeline):
+    """Find the next audio track above all existing audio clips in Resolve.
+
+    Mirrors find_next_available_channel() behaviour for the Blender VSE.
+    """
+    audio_track_count = timeline.GetTrackCount("audio")
+    if audio_track_count == 0:
+        return 1
+
+    max_used_track = 0
+    for track_idx in range(1, audio_track_count + 1):
+        items = timeline.GetItemListInTrack("audio", track_idx)
+        if items:
+            max_used_track = track_idx
+
+    return max_used_track + 1
+
+
+def _iter_resolve_collection(items):
+    """Iterate Resolve API collections that may be list/tuple/dict."""
+    if not items:
+        return []
+    if isinstance(items, dict):
+        return items.values()
+    return items
+
+
+def get_resolve_clip_file_path(clip):
+    """Get normalized source file path for a Resolve media clip, if available."""
+    clip_path = ""
+    try:
+        clip_path = clip.GetClipProperty("File Path")
+    except Exception:
+        clip_path = ""
+
+    if isinstance(clip_path, dict):
+        clip_path = clip_path.get("File Path", "")
+
+    if not clip_path:
+        try:
+            props = clip.GetClipProperty()
+            if isinstance(props, dict):
+                clip_path = props.get("File Path", "")
+        except Exception:
+            clip_path = ""
+
+    return os.path.realpath(clip_path) if clip_path else ""
+
+
+def build_resolve_media_pool_lookup(root_folder):
+    """Build media pool lookups keyed by path/name/stem across all folders."""
+    clip_by_path = {}
+    clip_by_name = {}
+    clip_by_stem = {}
+
+    def _scan(folder):
+        for clip in _iter_resolve_collection(folder.GetClipList()):
+            try:
+                clip_name = clip.GetName()
+            except Exception:
+                continue
+
+            if clip_name:
+                clip_by_name.setdefault(clip_name, clip)
+                clip_by_stem.setdefault(os.path.splitext(clip_name)[0], clip)
+
+            clip_path = get_resolve_clip_file_path(clip)
+            if clip_path:
+                clip_by_path.setdefault(clip_path, clip)
+
+        for sub in _iter_resolve_collection(folder.GetSubFolderList()):
+            _scan(sub)
+
+    _scan(root_folder)
+    return clip_by_path, clip_by_name, clip_by_stem
+
+
+def find_resolve_media_clip(sound_path, clip_by_path, clip_by_name, clip_by_stem):
+    """Resolve a source sound path to a Resolve MediaPoolItem."""
+    norm_path = os.path.realpath(sound_path)
+    media_clip = clip_by_path.get(norm_path)
+    if media_clip is not None:
+        return media_clip
+
+    sound_filename = os.path.basename(norm_path)
+    media_clip = clip_by_name.get(sound_filename)
+    if media_clip is not None:
+        return media_clip
+
+    sound_stem = os.path.splitext(sound_filename)[0]
+    media_clip = clip_by_stem.get(sound_stem)
+    if media_clip is not None:
+        return media_clip
+
+    for cname, cobj in clip_by_name.items():
+        if sound_filename in cname or cname in sound_filename:
+            return cobj
+
+    return None
+
+
+class VSE_OT_ImportOneSoundToDaVinciResolve(Operator):
+    """Import one selected sound and place it directly on Resolve timeline."""
+    bl_idname = "vse_event.import_one_sound_to_davinci_resolve"
+    bl_label = "Import One Sound"
+    bl_options = {'REGISTER'}
+
+    def execute(self, context):
+        settings = context.scene.vse_event_sound_settings
+
+        # Resolve selected sound file from Blender UI
+        sound_folder = bpy.path.abspath(settings.sound_folder)
+        if not sound_folder or not os.path.isdir(sound_folder):
+            self.report({'ERROR'}, "Select a valid sound folder first")
+            return {'CANCELLED'}
+
+        sound_filename = settings.sound_file
+        if not sound_filename or sound_filename == 'NONE':
+            self.report({'ERROR'}, "Select one sound file first")
+            return {'CANCELLED'}
+
+        sound_path = os.path.realpath(os.path.join(sound_folder, sound_filename))
+        if not os.path.isfile(sound_path):
+            self.report({'ERROR'}, f"Selected sound file not found: {sound_path}")
+            return {'CANCELLED'}
+
+        # Connect to Resolve
+        try:
+            resolve, project, timeline, media_pool = connect_to_davinci_resolve()
+        except RuntimeError as e:
+            self.report({'ERROR'}, str(e))
+            return {'CANCELLED'}
+
+        # Import one sound by full path
+        root_folder = media_pool.GetRootFolder()
+        media_pool.SetCurrentFolder(root_folder)
+        imported_clips = media_pool.ImportMedia([sound_path])
+
+        clip_by_path, clip_by_name, clip_by_stem = build_resolve_media_pool_lookup(root_folder)
+        imported_clip = find_resolve_media_clip(sound_path, clip_by_path, clip_by_name, clip_by_stem)
+
+        if imported_clip is None:
+            self.report({'ERROR'}, f"Failed to import selected sound: {sound_path}")
+            return {'CANCELLED'}
+
+        imported_name = imported_clip.GetName()
+        import_count = len(imported_clips) if imported_clips else 0
+
+        # Place directly on timeline (same simple placement style as the script)
+        resolve_fps = float(timeline.GetSetting("timelineFrameRate") or 24.0)
+        start_frame = timeline.GetStartFrame()
+        record_frame = start_frame + int(resolve_fps)  # +1 second
+        track_index = 1
+
+        # Ensure at least one audio track exists
+        current_track_count = timeline.GetTrackCount("audio")
+        for _ in range(max(0, track_index - current_track_count)):
+            timeline.AddTrack("audio")
+
+        clip_info = {
+            "mediaPoolItem": imported_clip,
+            "recordFrame": record_frame,
+            "trackIndex": track_index,
+            "mediaType": 2,  # Audio
+        }
+        placed = media_pool.AppendToTimeline([clip_info])
+        if not placed:
+            self.report(
+                {'WARNING'},
+                f"Imported '{imported_name}' but failed to place it on timeline (frame {record_frame}, track {track_index})"
+            )
+            return {'FINISHED'}
+
+        self.report(
+            {'INFO'},
+            f"Imported '{imported_name}' and placed on timeline at frame {record_frame}, track {track_index} (new imports: {import_count})"
+        )
+        return {'FINISHED'}
+
+
+class ResolvePlacementStrip:
+    """Lightweight strip-like object for Resolve track assignment.
+
+    We feed these through separate_overlapping_strips() so Resolve and VSE
+    use the exact same overlap/channel separation logic.
+    """
+    def __init__(self, frame_start, frame_end):
+        self.frame_final_start = frame_start
+        self.frame_final_end = frame_end
+        self.channel = 0
+
+
+def compute_resolve_track_assignments_with_vse_logic(clip_data, base_track=1):
+    """Assign Resolve tracks using the same logic as VSE channel separation.
+
+    Args:
+        clip_data: list of (frame, duration_frames) tuples
+        base_track: starting track index (1-based)
+
+    Returns:
+        list of track indices corresponding to clip_data order
+    """
+    mock_strips = [
+        ResolvePlacementStrip(frame, frame + duration_frames)
+        for frame, duration_frames in clip_data
+    ]
+    separate_overlapping_strips(mock_strips, base_track)
+    return [strip.channel for strip in mock_strips]
+
+
 class VSE_OT_AddSoundsAtZCrossings(Operator):
     """Scan timeline for bones crossing Z threshold and add sounds at those frames"""
     bl_idname = "vse_event.add_sounds_at_z_crossings"
@@ -362,38 +712,7 @@ class VSE_OT_AddSoundsAtZCrossings(Operator):
     
     def get_bones_in_collection(self, armature_obj, bone_collection_name):
         """Get list of bone names that belong to the specified bone collection."""
-        armature_data = armature_obj.data
-        bone_names = []
-        
-        if bone_collection_name == 'ALL':
-            return [bone.name for bone in armature_obj.pose.bones]
-        
-        if bone_collection_name == 'SELECTED':
-            # Get currently selected pose bones from context
-            # This works in Pose Mode and returns the selected bones
-            selected_pose_bones = bpy.context.selected_pose_bones
-            if selected_pose_bones:
-                for pose_bone in selected_pose_bones:
-                    # id_data gives us the Armature data block (not the Object)
-                    # Compare with armature_obj.data to check it's the same armature
-                    if pose_bone.id_data.name == armature_data.name:
-                        bone_names.append(pose_bone.name)
-            return bone_names
-        
-        # Blender 4.0+ uses bone collections
-        if hasattr(armature_data, 'collections'):
-            for bcol in armature_data.collections:
-                if bcol.name == bone_collection_name:
-                    # Get bones assigned to this collection
-                    for bone in armature_data.bones:
-                        if hasattr(bone, 'collections') and bcol in bone.collections.values():
-                            bone_names.append(bone.name)
-                        elif hasattr(bcol, 'bones'):
-                            if bone.name in [b.name for b in bcol.bones]:
-                                bone_names.append(bone.name)
-                    break
-        
-        return bone_names
+        return get_bones_for_collection(armature_obj, bone_collection_name)
     
     def execute(self, context):
         settings = context.scene.vse_event_sound_settings
@@ -470,43 +789,11 @@ class VSE_OT_AddSoundsAtZCrossings(Operator):
             return {'CANCELLED'}
         
         # Find all Z-crossing frames with their crossing speeds and bone names
-        # Dict: frame -> (speed, bone_name) - keeps the fastest crossing per frame
-        crossing_data = {}
-        
-        # Track previous Z positions for each bone
-        prev_z = {bone.name: None for bone in pose_bones}
-        threshold = settings.z_crossing_threshold
-        
-        # Single pass through timeline - evaluate all bones at each frame
-        for frame in range(frame_start, frame_end + 1):
-            scene.frame_set(frame)
-            
-            # Get world matrix once per frame
-            world_matrix = armature_obj.matrix_world
-            
-            # Check all bones at this frame
-            for pose_bone in pose_bones:
-                tail_world = world_matrix @ pose_bone.tail
-                world_z = tail_world.z
-                bone_prev_z = prev_z[pose_bone.name]
-                
-                # Inline crossing check for speed
-                if bone_prev_z is not None:
-                    if direction == 'BOTH':
-                        crossed = (bone_prev_z < threshold and world_z >= threshold) or (bone_prev_z > threshold and world_z <= threshold)
-                    elif direction == 'UP':
-                        crossed = bone_prev_z < threshold and world_z >= threshold
-                    else:  # DOWN
-                        crossed = bone_prev_z > threshold and world_z <= threshold
-                    
-                    if crossed:
-                        # Calculate crossing speed (absolute Z delta per frame)
-                        crossing_speed = abs(world_z - bone_prev_z)
-                        # Keep the maximum speed if multiple bones cross at the same frame
-                        if frame not in crossing_data or crossing_speed > crossing_data[frame][0]:
-                            crossing_data[frame] = (crossing_speed, pose_bone.name)
-                
-                prev_z[pose_bone.name] = world_z
+        crossing_data = detect_z_crossings(
+            scene, armature_obj, pose_bones,
+            settings.z_crossing_threshold, direction,
+            frame_start, frame_end
+        )
         
         # Restore original frame
         scene.frame_set(original_frame)
@@ -656,6 +943,276 @@ class VSE_OT_UseDefaultSounds(Operator):
             return {'CANCELLED'}
 
 
+class VSE_OT_SendSoundsToDaVinciResolve(Operator):
+    """Send Z-crossing sounds directly to a DaVinci Resolve timeline"""
+    bl_idname = "vse_event.send_sounds_to_davinci_resolve"
+    bl_label = "Send to DaVinci Resolve"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        settings = context.scene.vse_event_sound_settings
+        armature_name = settings.z_crossing_armature
+        direction = settings.z_crossing_direction
+
+        # ── Validate armature ───────────────────────────────────────────
+        if armature_name == 'NONE' or armature_name not in bpy.data.objects:
+            self.report({'ERROR'}, "Please select a valid armature")
+            return {'CANCELLED'}
+
+        armature_obj = bpy.data.objects[armature_name]
+        if armature_obj.type != 'ARMATURE':
+            self.report({'ERROR'}, f"'{armature_name}' is not an armature")
+            return {'CANCELLED'}
+
+        # ── Validate sound files ────────────────────────────────────────
+        sound_folder = bpy.path.abspath(settings.sound_folder)
+        selection_mode = settings.sound_selection_mode
+        if not sound_folder or not os.path.isdir(sound_folder):
+            self.report({'ERROR'}, "Select a valid sound folder first")
+            return {'CANCELLED'}
+
+        available_sound_files = get_sound_files_from_folder(sound_folder)
+        if not available_sound_files:
+            self.report({'ERROR'}, f"No sound files found in folder: {sound_folder}")
+            return {'CANCELLED'}
+
+        sound_path = None
+        if selection_mode == 'SINGLE':
+            sound_filename = settings.sound_file
+            if not sound_filename or sound_filename == 'NONE':
+                self.report({'ERROR'}, "Select one sound file first")
+                return {'CANCELLED'}
+            sound_path = os.path.realpath(os.path.join(sound_folder, sound_filename))
+            if not os.path.isfile(sound_path):
+                self.report({'ERROR'}, f"Selected sound file not found: {sound_path}")
+                return {'CANCELLED'}
+
+        # ── Get bones to monitor ────────────────────────────────────────
+        scene = context.scene
+        frame_start = scene.frame_start
+        frame_end = scene.frame_end
+        original_frame = scene.frame_current
+
+        bone_collection_name = settings.z_crossing_bone_collection
+        bone_names = get_bones_for_collection(armature_obj, bone_collection_name)
+
+        if not bone_names:
+            if bone_collection_name == 'SELECTED':
+                self.report({'ERROR'}, "No bones selected. Select bones in Pose Mode first.")
+            else:
+                self.report({'ERROR'}, f"No bones found in bone collection '{bone_collection_name}'")
+            return {'CANCELLED'}
+
+        pose_bones = [armature_obj.pose.bones[name] for name in bone_names
+                      if name in armature_obj.pose.bones]
+        if not pose_bones:
+            self.report({'ERROR'}, "No valid pose bones found")
+            return {'CANCELLED'}
+
+        # ── Detect Z-crossings ──────────────────────────────────────────
+        crossing_data = detect_z_crossings(
+            scene, armature_obj, pose_bones,
+            settings.z_crossing_threshold, direction,
+            frame_start, frame_end
+        )
+        scene.frame_set(original_frame)
+
+        if bone_collection_name == 'ALL':
+            source_name = "all bones"
+        elif bone_collection_name == 'SELECTED':
+            source_name = f"{len(bone_names)} selected bones"
+        else:
+            source_name = f"bones in '{bone_collection_name}'"
+
+        if not crossing_data:
+            self.report({'WARNING'}, f"No Z crossings found for {source_name}")
+            return {'CANCELLED'}
+
+        # ── Normalize speeds ────────────────────────────────────────────
+        crossing_frames = sorted(crossing_data.keys())
+        speeds = [crossing_data[f][0] for f in crossing_frames]
+        max_speed = max(speeds) if speeds else 1.0
+        min_speed = min(speeds) if speeds else 0.0
+        speed_range = max_speed - min_speed if max_speed > min_speed else 1.0
+
+        # ── Connect to DaVinci Resolve ──────────────────────────────────
+        try:
+            resolve, project, timeline, media_pool = connect_to_davinci_resolve()
+        except RuntimeError as e:
+            self.report({'ERROR'}, str(e))
+            return {'CANCELLED'}
+
+        self.report({'INFO'}, f"Connected to DaVinci Resolve project: {project.GetName()}")
+
+        # ── Frame-rate conversion setup ─────────────────────────────────
+        try:
+            resolve_fps = float(timeline.GetSetting("timelineFrameRate") or 24.0)
+        except (TypeError, ValueError):
+            resolve_fps = 24.0
+        resolve_start = timeline.GetStartFrame()
+        blender_fps = scene.render.fps / scene.render.fps_base
+
+        # ── Collect unique sound file paths (absolute) ─────────────────
+        if selection_mode == 'SINGLE':
+            all_sound_paths = [sound_path]
+        else:
+            all_sound_paths = [
+                os.path.realpath(os.path.join(sound_folder, f))
+                for f in available_sound_files
+            ]
+
+        # Deduplicate while preserving order
+        all_sound_paths = [
+            p for p in dict.fromkeys(all_sound_paths)
+            if p and os.path.isfile(p)
+        ]
+        if not all_sound_paths:
+            self.report({'ERROR'}, "No sound files resolved for DaVinci Resolve import")
+            return {'CANCELLED'}
+
+        # ── Import sound files into Resolve media pool ──────────────────
+        # Set root folder as the active folder for imports
+        root_folder = media_pool.GetRootFolder()
+        media_pool.SetCurrentFolder(root_folder)
+
+        imported_clips = media_pool.ImportMedia(all_sound_paths)
+
+        # Build lookup from imported clips first
+        clip_by_path = {}
+        clip_by_name = {}
+        clip_by_stem = {}
+        if imported_clips:
+            for clip in _iter_resolve_collection(imported_clips):
+                clip_name = clip.GetName()
+                if clip_name:
+                    clip_by_name.setdefault(clip_name, clip)
+                    clip_by_stem.setdefault(os.path.splitext(clip_name)[0], clip)
+                clip_path = get_resolve_clip_file_path(clip)
+                if clip_path:
+                    clip_by_path.setdefault(clip_path, clip)
+
+        # Also scan full media pool (covers already-imported clips and bins)
+        pool_by_path, pool_by_name, pool_by_stem = build_resolve_media_pool_lookup(root_folder)
+        for key, val in pool_by_path.items():
+            clip_by_path.setdefault(key, val)
+        for key, val in pool_by_name.items():
+            clip_by_name.setdefault(key, val)
+        for key, val in pool_by_stem.items():
+            clip_by_stem.setdefault(key, val)
+
+        # Pre-resolve requested files to media items
+        resolved_sound_clips = {
+            sp: find_resolve_media_clip(sp, clip_by_path, clip_by_name, clip_by_stem)
+            for sp in all_sound_paths
+        }
+
+        usable_sound_paths = [sp for sp, clip in resolved_sound_clips.items() if clip is not None]
+
+        if not usable_sound_paths:
+            paths_str = ", ".join(os.path.basename(p) for p in all_sound_paths[:5])
+            if len(all_sound_paths) > 5:
+                paths_str += ", ..."
+            self.report({'ERROR'},
+                        f"Failed to import sound files into DaVinci Resolve media pool: {paths_str}")
+            return {'CANCELLED'}
+
+        if selection_mode == 'SINGLE' and sound_path not in usable_sound_paths:
+            self.report({'ERROR'}, f"Selected sound could not be resolved in Resolve: {sound_path}")
+            return {'CANCELLED'}
+
+        # ── Cache audio durations for track assignment ──────────────────
+        sound_durations = {}
+        for fp in usable_sound_paths:
+            sound_durations[fp] = get_audio_duration_seconds(fp)
+
+        # ── Build placement list ────────────────────────────────────────
+        volume_slowest = settings.volume_slowest
+        volume_fastest = settings.volume_fastest
+        volume_randomness = settings.volume_randomness
+
+        placements = []  # (resolve_frame, dur_frames, sound_path, bone_name, volume)
+
+        for frame in crossing_frames:
+            crossing_speed, bone_name = crossing_data[frame]
+
+            # Pick sound file
+            if selection_mode == 'RANDOM':
+                current_sound_path = random.choice(usable_sound_paths)
+            else:
+                current_sound_path = sound_path
+
+            # Speed-based volume
+            if speed_range > 0:
+                normalized_speed = (crossing_speed - min_speed) / speed_range
+            else:
+                normalized_speed = 1.0
+            base_volume = volume_slowest + (normalized_speed * (volume_fastest - volume_slowest))
+            final_volume = get_random_volume(base_volume, volume_randomness)
+
+            # Convert Blender frame -> Resolve frame
+            seconds_from_start = (frame - frame_start) / blender_fps
+            resolve_frame = resolve_start + int(seconds_from_start * resolve_fps)
+
+            # Clip duration in Resolve frames
+            dur_sec = sound_durations.get(current_sound_path, 1.0)
+            dur_frames = max(1, int(dur_sec * resolve_fps))
+
+            placements.append((resolve_frame, dur_frames, current_sound_path, bone_name, final_volume))
+
+        # ── Pre-compute track assignments (exact VSE overlap logic) ─
+        base_track = find_next_available_audio_track(timeline)
+        clip_frame_data = [(p[0], p[1]) for p in placements]
+        track_assignments = compute_resolve_track_assignments_with_vse_logic(
+            clip_frame_data, base_track
+        )
+
+        # Ensure enough audio tracks exist in Resolve
+        max_track_needed = max(track_assignments) if track_assignments else base_track
+        current_track_count = timeline.GetTrackCount("audio")
+        for _ in range(max(0, max_track_needed - current_track_count)):
+            timeline.AddTrack("audio")
+
+        # ── Place clips on Resolve timeline ─────────────────────────────
+        placed_count = 0
+        for i, (resolve_frame, dur_frames, snd_path, bone_name, volume) in enumerate(placements):
+            track_index = track_assignments[i]
+            volume_percent = int(round(volume * 100))
+
+            snd_key = os.path.realpath(snd_path)
+            media_clip = resolved_sound_clips.get(snd_key)
+            if media_clip is None:
+                media_clip = find_resolve_media_clip(
+                    snd_key, clip_by_path, clip_by_name, clip_by_stem
+                )
+                if media_clip is not None:
+                    resolved_sound_clips[snd_key] = media_clip
+
+            if media_clip is None:
+                snd_filename = os.path.basename(snd_key)
+                self.report({'WARNING'}, f"Could not find imported clip for {snd_filename}")
+                continue
+
+            clip_info = {
+                "mediaPoolItem": media_clip,
+                "recordFrame": resolve_frame,
+                "trackIndex": track_index,
+                "mediaType": 2,  # Audio
+            }
+
+            result = media_pool.AppendToTimeline([clip_info])
+            if result:
+                placed_count += 1
+            else:
+                self.report({'WARNING'},
+                            f"Failed to place {bone_name}_vol{volume_percent} "
+                            f"at frame {resolve_frame}, track {track_index}")
+
+        self.report({'INFO'},
+                     f"Sent {placed_count}/{len(placements)} sounds to DaVinci Resolve "
+                     f"(tracks {base_track}-{max_track_needed})")
+        return {'FINISHED'}
+
+
 class VSE_PT_MotionSoundsPanel(Panel):
     """Main panel in the N-panel of the 3D Viewport"""
     bl_label = "Motion Sounds"
@@ -754,13 +1311,31 @@ class VSE_PT_ZCrossingPanel(Panel):
         
         layout.separator()
         
-        # Main button
+        # Main button – place sounds in Blender VSE
         row = layout.row(align=True)
         row.scale_y = 1.3
         row.operator(
             VSE_OT_AddSoundsAtZCrossings.bl_idname,
             text="Add Sounds at Crossings",
             icon='ADD'
+        )
+        
+        # Send sounds to DaVinci Resolve
+        row = layout.row(align=True)
+        row.scale_y = 1.3
+        row.operator(
+            VSE_OT_SendSoundsToDaVinciResolve.bl_idname,
+            text="Send to DaVinci Resolve",
+            icon='EXPORT'
+        )
+
+        # Import one selected sound to DaVinci Resolve media pool
+        row = layout.row(align=True)
+        row.scale_y = 1.3
+        row.operator(
+            VSE_OT_ImportOneSoundToDaVinciResolve.bl_idname,
+            text="Import One Sound",
+            icon='IMPORT'
         )
         
         # Info
