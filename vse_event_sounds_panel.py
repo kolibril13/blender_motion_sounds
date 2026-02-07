@@ -409,15 +409,13 @@ class VSE_OT_AddSoundsAtZCrossings(Operator):
             return [bone.name for bone in armature_obj.pose.bones]
         
         if bone_collection_name == 'SELECTED':
-            # Get currently selected pose bones from context
-            # This works in Pose Mode and returns the selected bones
-            selected_pose_bones = bpy.context.selected_pose_bones
-            if selected_pose_bones:
-                for pose_bone in selected_pose_bones:
-                    # id_data gives us the Armature data block (not the Object)
-                    # Compare with armature_obj.data to check it's the same armature
-                    if pose_bone.id_data.name == armature_data.name:
-                        bone_names.append(pose_bone.name)
+            # Check bone selection state directly from the pose bone
+            # In Blender 5.0+, select was moved from Bone to PoseBone
+            # Also avoids using bpy.context.selected_pose_bones which is
+            # unavailable when the operator is invoked from a sidebar panel
+            for pose_bone in armature_obj.pose.bones:
+                if pose_bone.select:
+                    bone_names.append(pose_bone.name)
             return bone_names
         
         # Blender 4.0+ uses bone collections
