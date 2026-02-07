@@ -616,6 +616,18 @@ class VSE_OT_AddSoundsAtZCrossings(Operator):
         return {'FINISHED'}
 
 
+class VSE_OT_RenderAudio(Operator):
+    """Render the scene's audio to a sound file (same as Render > Render Audio)"""
+    bl_idname = "vse_event.render_audio"
+    bl_label = "Render Audio"
+    bl_options = {'REGISTER'}
+
+    def execute(self, context):
+        # Invoke the built-in mixdown operator with its file dialog
+        bpy.ops.sound.mixdown('INVOKE_DEFAULT')
+        return {'FINISHED'}
+
+
 class VSE_OT_SelectSoundFolder(Operator):
     """Open file browser to select a folder containing sound files"""
     bl_idname = "vse_event.select_sound_folder"
@@ -721,6 +733,27 @@ class VSE_PT_MotionSoundsPanel(Panel):
         
         col.separator()
         col.prop(settings, "volume_randomness", text="Volume Randomness", slider=True)
+
+
+class VSE_PT_RenderAudioPanel(Panel):
+    """Sub-panel with a Render Audio button"""
+    bl_label = "Render Audio"
+    bl_idname = "VSE_PT_render_audio_panel"
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = "Motion Sounds"
+    bl_parent_id = "VSE_PT_motion_sounds_panel"
+    bl_options = {'DEFAULT_CLOSED'}
+
+    def draw(self, context):
+        layout = self.layout
+        row = layout.row(align=True)
+        row.scale_y = 1.3
+        row.operator(
+            VSE_OT_RenderAudio.bl_idname,
+            text="Render Audio",
+            icon='FILE_SOUND'
+        )
 
 
 class VSE_PT_ZCrossingPanel(Panel):
