@@ -76,6 +76,11 @@ class VSE_PT_CollisionSoundsPanel(Panel):
         else:
             layout.prop(props, "moving_collection", text="")
 
+        layout.separator()
+
+        # --- Detect Collisions ---
+        layout.operator("collision_sounds.detect", icon='PLAY')
+ 
 
 def register():
     bpy.types.Scene.collision_sounds = PointerProperty(type=CollisionSoundsProperties)
