@@ -68,6 +68,7 @@ license = [
 paths_exclude_pattern = [
   "__pycache__/",
   "/.git/",
+  "/.github/",
   "/*.zip",
   "/thumbnail*.png",
   "/README.md",
